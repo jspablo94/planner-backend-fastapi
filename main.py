@@ -62,4 +62,51 @@ async def importar_excel(file: UploadFile = File(...)):
             ("Tipo de Serviço" if "Tipo de Serviço" in cols else None)
         )
 
-        # Se não encontrou colunas
+        # Se não encontrou colunas mínimas, devolve 400 com diagnóstico
+        if not col_os or not col_desc or not col_tipo:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "erro": "Não encontrei as colunas esperadas.",
+                    "colunas_encontradas": cols,
+                    "esperado": ["OS (ou Ordem)", "Descricao/Descrição", "Tipo/Tipo de Serviço"],
+                    "dica": "Me diga os nomes exatos das colunas do seu Excel para eu ajustar o mapeamento."
+                }
+            )
+
+        count_before = len(ordens)
+
+        for _, row in df.iterrows():
+            numero_os = str(row.get(col_os, "")).strip()
+            descricao = str(row.get(col_desc, "")).strip()
+            tipo = str(row.get(col_tipo, "")).strip()
+
+            # Ignora linhas totalmente vazias
+            if not (numero_os or descricao or tipo):
+                continue
+
+            ordens.append({
+                "id": len(ordens) + 1,
+                "numero_os": numero_os,
+                "descricao": descricao,
+                "tipo_servico": tipo,
+            })
+
+        return {
+            "status": "Importação concluída",
+            "adicionadas": len(ordens) - count_before,
+            "total": len(ordens),
+            "colunas_lidas": cols
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Retorna o erro real para facilitar correção
+        raise HTTPException(status_code=500, detail={"erro": str(e)})
+
+
+@app.get("/ordens")
+def listar_ordens():
+    """Retorna as ordens importadas (em memória)."""
+    return ordens
