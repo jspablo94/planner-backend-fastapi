@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 from datetime import date, time, datetime
-from typing import List, Optional
+from typing import List, Optional, Set
 
 app = FastAPI(title="Planner Manutenção - Backend")
 
@@ -20,15 +20,15 @@ app.add_middleware(
 ordens = []
 programacoes = []
 
-TIPOS_SERVICO_VALIDOS = {
+TIPOS_SERVICO_SUGERIDOS = [
     "Altura",
     "Espaço Confinado",
     "Trabalho a quente",
     "Trabalho elétrico",
     "Terceirizado",
-}
+]
 
-STATUS_VALIDOS = {"Planejado", "Em execução", "Concluído", "Reprogramado"}
+STATUS_VALIDOS = ["Planejado", "Em execução", "Concluído", "Reprogramado"]
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -37,11 +37,34 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def pick_col(cols: List[str], options: List[str]) -> Optional[str]:
+    for opt in options:
+        if opt in cols:
+            return opt
+    return None
+
+
+def parse_executantes_free_text(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    # separa por vírgula ou ponto e vírgula
+    parts = [p.strip() for p in str(s).replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
+
 # -----------------------------
 # Importação (Excel/CSV)
 # -----------------------------
 @app.post("/importar-excel")
 async def importar_excel(file: UploadFile = File(...)):
+    """
+    Recebe xlsx/xls/csv e adiciona as OS em memória.
+    Colunas esperadas (com variações):
+      - OS (ou Ordem)
+      - Descricao/Descrição/Descrição Curta/Descrição do Serviço
+      - Tipo (ou Tipo de Serviço)
+      - Setor (ou Área, Setor de Manutenção, Local, Centro de Trabalho)
+    """
     try:
         filename = (file.filename or "").lower()
         raw = await file.read()
@@ -56,17 +79,19 @@ async def importar_excel(file: UploadFile = File(...)):
         df = normalize_columns(df)
         cols = df.columns.tolist()
 
-        col_os = "OS" if "OS" in cols else ("Ordem" if "Ordem" in cols else None)
-        col_desc = "Descricao" if "Descricao" in cols else ("Descrição" if "Descrição" in cols else None)
-        col_tipo = "Tipo" if "Tipo" in cols else ("Tipo de Serviço" if "Tipo de Serviço" in cols else None)
+        col_os = pick_col(cols, ["OS", "Ordem", "Ordem de Serviço", "Numero OS", "Número OS"])
+        col_desc = pick_col(cols, ["Descricao", "Descrição", "Descrição Curta", "Descrição do Serviço", "Descrição da OS", "1 Descrição"])
+        col_tipo = pick_col(cols, ["Tipo", "Tipo de Serviço", "Tipo de Servico"])
+        col_setor = pick_col(cols, ["Setor", "Área", "Area", "Setor de Manutenção", "Local", "Centro de Trabalho", "1 Setor"])
 
-        if not col_os or not col_desc or not col_tipo:
+        if not col_os or not col_desc:
             raise HTTPException(
                 status_code=400,
                 detail={
-                    "erro": "Não encontrei as colunas esperadas.",
+                    "erro": "Não encontrei colunas mínimas para importar.",
                     "colunas_encontradas": cols,
-                    "esperado": ["OS (ou Ordem)", "Descricao/Descrição", "Tipo/Tipo de Serviço"],
+                    "minimo_esperado": ["OS (ou Ordem)", "Descrição/Descricao"],
+                    "dica": "Me diga os nomes exatos das colunas caso estejam diferentes.",
                 },
             )
 
@@ -75,9 +100,10 @@ async def importar_excel(file: UploadFile = File(...)):
         for _, row in df.iterrows():
             numero_os = str(row.get(col_os, "")).strip()
             descricao = str(row.get(col_desc, "")).strip()
-            tipo = str(row.get(col_tipo, "")).strip()
+            tipo = str(row.get(col_tipo, "")).strip() if col_tipo else ""
+            setor = str(row.get(col_setor, "")).strip() if col_setor else ""
 
-            if not (numero_os or descricao or tipo):
+            if not (numero_os or descricao):
                 continue
 
             ordens.append(
@@ -86,6 +112,7 @@ async def importar_excel(file: UploadFile = File(...)):
                     "numero_os": numero_os,
                     "descricao": descricao,
                     "tipo_servico": tipo,
+                    "setor": setor,
                 }
             )
 
@@ -94,6 +121,12 @@ async def importar_excel(file: UploadFile = File(...)):
             "adicionadas": len(ordens) - count_before,
             "total": len(ordens),
             "colunas_lidas": cols,
+            "mapeamento": {
+                "os": col_os,
+                "descricao": col_desc,
+                "tipo": col_tipo,
+                "setor": col_setor,
+            },
         }
 
     except HTTPException:
@@ -107,6 +140,32 @@ def listar_ordens():
     return ordens
 
 
+@app.get("/setores")
+def listar_setores():
+    s: Set[str] = set()
+    for o in ordens:
+        v = (o.get("setor") or "").strip()
+        if v:
+            s.add(v)
+    return sorted(list(s))
+
+
+@app.get("/tipos")
+def listar_tipos():
+    # mistura os sugeridos com os que vierem das OS
+    s: Set[str] = set(TIPOS_SERVICO_SUGERIDOS)
+    for o in ordens:
+        v = (o.get("tipo_servico") or "").strip()
+        if v:
+            s.add(v)
+    return sorted(list(s))
+
+
+@app.get("/status")
+def listar_status():
+    return STATUS_VALIDOS
+
+
 # -----------------------------
 # Programação (Planner)
 # -----------------------------
@@ -115,7 +174,7 @@ class ProgramarRequest(BaseModel):
     data: date
     periodo: str  # "Manhã" | "Tarde"
     horario: time
-    executantes: Optional[List[str]] = []
+    executantes_texto: Optional[str] = ""  # texto livre (ex: "João, Maria")
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
     observacoes: Optional[str] = ""
@@ -123,37 +182,31 @@ class ProgramarRequest(BaseModel):
 
 @app.post("/programar")
 def programar(req: ProgramarRequest):
-    # valida período
     if req.periodo not in {"Manhã", "Tarde"}:
         raise HTTPException(status_code=400, detail={"erro": "periodo inválido. Use 'Manhã' ou 'Tarde'."})
 
-    # valida status
     if req.status and req.status not in STATUS_VALIDOS:
-        raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {sorted(STATUS_VALIDOS)}"})
+        raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {STATUS_VALIDOS}"})
 
-    # acha OS
     os_item = next((o for o in ordens if o.get("id") == req.ordem_id), None)
     if not os_item:
         raise HTTPException(status_code=404, detail={"erro": "Ordem de serviço não encontrada", "ordem_id": req.ordem_id})
 
-    # define tipo_servico (se não vier, usa o da OS)
-    tipo = req.tipo_servico or os_item.get("tipo_servico") or ""
-
-    # (opcional) validar contra lista de tipos conhecidos
-    # Se seu CMMS tiver variações, pode comentar esta validação.
-    if tipo in TIPOS_SERVICO_VALIDOS or tipo == "":
-        pass
-    # else: não bloqueia, só aceita (mantém flexível)
+    tipo = (req.tipo_servico or os_item.get("tipo_servico") or "").strip()
+    setor = (os_item.get("setor") or "").strip()
+    executantes = parse_executantes_free_text(req.executantes_texto)
 
     prog = {
         "id": len(programacoes) + 1,
         "ordem_id": os_item["id"],
         "numero_os": os_item.get("numero_os"),
         "descricao": os_item.get("descricao"),
+        "setor": setor,
         "data": req.data.isoformat(),
         "periodo": req.periodo,
         "horario_inicio": req.horario.strftime("%H:%M"),
-        "executantes": req.executantes or [],
+        "executantes": executantes,
+        "executantes_texto": req.executantes_texto or "",
         "tipo_servico": tipo,
         "status": req.status or "Planejado",
         "observacoes": req.observacoes or "",
@@ -168,7 +221,6 @@ def listar_programacoes(
     data_ini: Optional[date] = None,
     data_fim: Optional[date] = None,
 ):
-    # se vier filtro de data, aplica
     if data_ini or data_fim:
         def in_range(p):
             d = date.fromisoformat(p["data"])
@@ -177,7 +229,5 @@ def listar_programacoes(
             if data_fim and d > data_fim:
                 return False
             return True
-
         return [p for p in programacoes if in_range(p)]
-
     return programacoes
