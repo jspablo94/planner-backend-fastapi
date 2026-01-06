@@ -47,7 +47,6 @@ def pick_col(cols: List[str], options: List[str]) -> Optional[str]:
 def parse_executantes_free_text(s: Optional[str]) -> List[str]:
     if not s:
         return []
-    # separa por vírgula ou ponto e vírgula
     parts = [p.strip() for p in str(s).replace(";", ",").split(",")]
     return [p for p in parts if p]
 
@@ -57,14 +56,6 @@ def parse_executantes_free_text(s: Optional[str]) -> List[str]:
 # -----------------------------
 @app.post("/importar-excel")
 async def importar_excel(file: UploadFile = File(...)):
-    """
-    Recebe xlsx/xls/csv e adiciona as OS em memória.
-    Colunas esperadas (com variações):
-      - OS (ou Ordem)
-      - Descricao/Descrição/Descrição Curta/Descrição do Serviço
-      - Tipo (ou Tipo de Serviço)
-      - Setor (ou Área, Setor de Manutenção, Local, Centro de Trabalho)
-    """
     try:
         filename = (file.filename or "").lower()
         raw = await file.read()
@@ -91,7 +82,6 @@ async def importar_excel(file: UploadFile = File(...)):
                     "erro": "Não encontrei colunas mínimas para importar.",
                     "colunas_encontradas": cols,
                     "minimo_esperado": ["OS (ou Ordem)", "Descrição/Descricao"],
-                    "dica": "Me diga os nomes exatos das colunas caso estejam diferentes.",
                 },
             )
 
@@ -121,12 +111,7 @@ async def importar_excel(file: UploadFile = File(...)):
             "adicionadas": len(ordens) - count_before,
             "total": len(ordens),
             "colunas_lidas": cols,
-            "mapeamento": {
-                "os": col_os,
-                "descricao": col_desc,
-                "tipo": col_tipo,
-                "setor": col_setor,
-            },
+            "mapeamento": {"os": col_os, "descricao": col_desc, "tipo": col_tipo, "setor": col_setor},
         }
 
     except HTTPException:
@@ -152,7 +137,6 @@ def listar_setores():
 
 @app.get("/tipos")
 def listar_tipos():
-    # mistura os sugeridos com os que vierem das OS
     s: Set[str] = set(TIPOS_SERVICO_SUGERIDOS)
     for o in ordens:
         v = (o.get("tipo_servico") or "").strip()
@@ -174,10 +158,25 @@ class ProgramarRequest(BaseModel):
     data: date
     periodo: str  # "Manhã" | "Tarde"
     horario: time
-    executantes_texto: Optional[str] = ""  # texto livre (ex: "João, Maria")
+    executantes_texto: Optional[str] = ""
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
     observacoes: Optional[str] = ""
+
+
+class AtualizarProgramacaoRequest(BaseModel):
+    # tudo editável (inclusive data/período/hora = reprogramação)
+    data: date
+    periodo: str
+    horario: time
+    executantes_texto: Optional[str] = ""
+    tipo_servico: Optional[str] = None
+    status: Optional[str] = "Planejado"
+    observacoes: Optional[str] = ""
+
+
+def find_programacao(prog_id: int):
+    return next((p for p in programacoes if p.get("id") == prog_id), None)
 
 
 @app.post("/programar")
@@ -211,9 +210,44 @@ def programar(req: ProgramarRequest):
         "status": req.status or "Planejado",
         "observacoes": req.observacoes or "",
         "criado_em": datetime.utcnow().isoformat() + "Z",
+        "atualizado_em": None,
     }
     programacoes.append(prog)
     return {"status": "OK", "programacao": prog}
+
+
+@app.put("/programacoes/{prog_id}")
+def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
+    p = find_programacao(prog_id)
+    if not p:
+        raise HTTPException(status_code=404, detail={"erro": "Programação não encontrada", "id": prog_id})
+
+    if req.periodo not in {"Manhã", "Tarde"}:
+        raise HTTPException(status_code=400, detail={"erro": "periodo inválido. Use 'Manhã' ou 'Tarde'."})
+
+    if req.status and req.status not in STATUS_VALIDOS:
+        raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {STATUS_VALIDOS}"})
+
+    p["data"] = req.data.isoformat()
+    p["periodo"] = req.periodo
+    p["horario_inicio"] = req.horario.strftime("%H:%M")
+    p["executantes_texto"] = req.executantes_texto or ""
+    p["executantes"] = parse_executantes_free_text(req.executantes_texto)
+    if req.tipo_servico is not None:
+        p["tipo_servico"] = (req.tipo_servico or "").strip()
+    p["status"] = req.status or "Planejado"
+    p["observacoes"] = req.observacoes or ""
+    p["atualizado_em"] = datetime.utcnow().isoformat() + "Z"
+    return {"status": "OK", "programacao": p}
+
+
+@app.delete("/programacoes/{prog_id}")
+def deletar_programacao(prog_id: int):
+    p = find_programacao(prog_id)
+    if not p:
+        raise HTTPException(status_code=404, detail={"erro": "Programação não encontrada", "id": prog_id})
+    programacoes.remove(p)
+    return {"status": "OK", "removida_id": prog_id}
 
 
 @app.get("/programacoes")
