@@ -132,6 +132,8 @@ def conflitos_execucao_regra_b(
     for p in progs:
         if ignorar_prog_id is not None and p.get("id") == ignorar_prog_id:
             continue
+
+        # Conflito por hora somente no mesmo dia do "start"
         if p.get("data") != data_iso:
             continue
 
@@ -153,6 +155,13 @@ def conflitos_execucao_regra_b(
     return conflitos
 
 
+def categoria_por_intervencao(interv: str) -> str:
+    s = (interv or "").strip()
+    if s.upper().startswith("UPLN"):
+        return "Corretiva"
+    return "Preventiva"
+
+
 # -----------------------------
 # Planners (Programações nomeadas)
 # -----------------------------
@@ -167,7 +176,6 @@ def create_planner(req: CreatePlannerRequest):
     if not name:
         raise HTTPException(status_code=400, detail={"erro": "Nome do planner é obrigatório."})
 
-    # evita nomes duplicados (opcional)
     for p in planners.values():
         if (p.get("name") or "").strip().lower() == name.lower():
             raise HTTPException(status_code=409, detail={"erro": "Já existe um planner com esse nome."})
@@ -212,6 +220,7 @@ async def importar_excel(file: UploadFile = File(...)):
         col_desc = pick_col(cols, ["Descricao", "Descrição", "Descrição Curta", "Descrição do Serviço", "Descrição da OS", "1 Descrição"])
         col_tipo = pick_col(cols, ["Tipo", "Tipo de Serviço", "Tipo de Servico"])
         col_setor = pick_col(cols, ["Setor", "Área", "Area", "Setor de Manutenção", "Local", "Centro de Trabalho", "1 Setor"])
+        col_interv = pick_col(cols, ["Intervenção", "Intervencao", "Intervenção (Código)", "Intervencao (Codigo)", "Intervencao Codigo"])
 
         if not col_os or not col_desc:
             raise HTTPException(
@@ -230,6 +239,7 @@ async def importar_excel(file: UploadFile = File(...)):
             descricao = str(row.get(col_desc, "")).strip()
             tipo = str(row.get(col_tipo, "")).strip() if col_tipo else ""
             setor = str(row.get(col_setor, "")).strip() if col_setor else ""
+            interv = str(row.get(col_interv, "")).strip() if col_interv else ""
 
             if not (numero_os or descricao):
                 continue
@@ -241,6 +251,8 @@ async def importar_excel(file: UploadFile = File(...)):
                     "descricao": descricao,
                     "tipo_servico": tipo,
                     "setor": setor,
+                    "intervencao": interv,
+                    "categoria_os": categoria_por_intervencao(interv),
                 }
             )
 
@@ -249,7 +261,7 @@ async def importar_excel(file: UploadFile = File(...)):
             "adicionadas": len(ordens) - count_before,
             "total": len(ordens),
             "colunas_lidas": cols,
-            "mapeamento": {"os": col_os, "descricao": col_desc, "tipo": col_tipo, "setor": col_setor},
+            "mapeamento": {"os": col_os, "descricao": col_desc, "tipo": col_tipo, "setor": col_setor, "intervencao": col_interv},
         }
 
     except HTTPException:
@@ -304,9 +316,11 @@ class ProgramarRequest(BaseModel):
     planner_id: int
     ordem_id: int
     data: date
+    data_conclusao: Optional[date] = None  # NOVO (default = data)
     periodo: str  # "Manhã" | "Tarde"
     horario: time
     duracao_min: Optional[int] = None
+    area: Optional[str] = ""  # NOVO (texto livre)
     executantes_texto: Optional[str] = ""
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
@@ -316,9 +330,11 @@ class ProgramarRequest(BaseModel):
 class AtualizarProgramacaoRequest(BaseModel):
     planner_id: int
     data: date
+    data_conclusao: Optional[date] = None
     periodo: str
     horario: time
     duracao_min: Optional[int] = None
+    area: Optional[str] = ""
     executantes_texto: Optional[str] = ""
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
@@ -340,11 +356,13 @@ def programar(req: ProgramarRequest):
     if not os_item:
         raise HTTPException(status_code=404, detail={"erro": "Ordem de serviço não encontrada", "ordem_id": req.ordem_id})
 
-    # regra: OS não pode repetir no mesmo planner
     if any(p.get("ordem_id") == req.ordem_id for p in progs):
         raise HTTPException(status_code=409, detail={"erro": "Essa OS já está usada neste planner."})
 
-    # Conflitos (Regra B)
+    data_conc = req.data_conclusao or req.data
+    if data_conc < req.data:
+        raise HTTPException(status_code=400, detail={"erro": "data_conclusao não pode ser menor que data."})
+
     conflitos = conflitos_execucao_regra_b(
         progs,
         req.data.isoformat(),
@@ -356,10 +374,7 @@ def programar(req: ProgramarRequest):
     if conflitos:
         raise HTTPException(
             status_code=409,
-            detail={
-                "erro": "Conflito de executantes por horário (Regra B).",
-                "conflitos": conflitos,
-            },
+            detail={"erro": "Conflito de executantes por horário (Regra B).", "conflitos": conflitos},
         )
 
     tipo = (req.tipo_servico or os_item.get("tipo_servico") or "").strip()
@@ -375,7 +390,11 @@ def programar(req: ProgramarRequest):
         "numero_os": os_item.get("numero_os"),
         "descricao": os_item.get("descricao"),
         "setor": setor,
+        "intervencao": os_item.get("intervencao", ""),
+        "categoria_os": os_item.get("categoria_os", "Preventiva"),
+        "area": (req.area or "").strip(),
         "data": req.data.isoformat(),
+        "data_conclusao": data_conc.isoformat(),
         "periodo": req.periodo,
         "horario_inicio": req.horario.strftime("%H:%M"),
         "duracao_min": req.duracao_min,
@@ -400,14 +419,17 @@ def listar_programacoes(
     progs = get_programacoes(planner_id)
 
     if data_ini or data_fim:
-        def in_range(p):
-            d = date.fromisoformat(p["data"])
-            if data_ini and d < data_ini:
+        def overlaps_range(p):
+            start = date.fromisoformat(p["data"])
+            end = date.fromisoformat(p.get("data_conclusao") or p["data"])
+            # range query [data_ini, data_fim] deve incluir qualquer prog que interseccione
+            if data_ini and end < data_ini:
                 return False
-            if data_fim and d > data_fim:
+            if data_fim and start > data_fim:
                 return False
             return True
-        return [p for p in progs if in_range(p)]
+
+        return [p for p in progs if overlaps_range(p)]
 
     return progs
 
@@ -426,6 +448,10 @@ def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
     if req.status and req.status not in STATUS_VALIDOS:
         raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {STATUS_VALIDOS}"})
 
+    data_conc = req.data_conclusao or req.data
+    if data_conc < req.data:
+        raise HTTPException(status_code=400, detail={"erro": "data_conclusao não pode ser menor que data."})
+
     conflitos = conflitos_execucao_regra_b(
         progs,
         req.data.isoformat(),
@@ -437,16 +463,15 @@ def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
     if conflitos:
         raise HTTPException(
             status_code=409,
-            detail={
-                "erro": "Conflito de executantes por horário (Regra B).",
-                "conflitos": conflitos,
-            },
+            detail={"erro": "Conflito de executantes por horário (Regra B).", "conflitos": conflitos},
         )
 
     p["data"] = req.data.isoformat()
+    p["data_conclusao"] = data_conc.isoformat()
     p["periodo"] = req.periodo
     p["horario_inicio"] = req.horario.strftime("%H:%M")
     p["duracao_min"] = req.duracao_min
+    p["area"] = (req.area or "").strip()
     p["executantes_texto"] = req.executantes_texto or ""
     p["executantes"] = parse_executantes_free_text(req.executantes_texto)
     if req.tipo_servico is not None:
