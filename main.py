@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 from datetime import date, time, datetime
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 app = FastAPI(title="Planner Manutenção - Backend")
 
@@ -49,6 +49,99 @@ def parse_executantes_free_text(s: Optional[str]) -> List[str]:
         return []
     parts = [p.strip() for p in str(s).replace(";", ",").split(",")]
     return [p for p in parts if p]
+
+
+def normalize_name(name: str) -> str:
+    return " ".join((name or "").strip().lower().split())
+
+
+def get_exec_set(executantes_texto: str) -> Set[str]:
+    return set(normalize_name(x) for x in parse_executantes_free_text(executantes_texto) if normalize_name(x))
+
+
+def time_to_minutes(t: time) -> int:
+    return t.hour * 60 + t.minute
+
+
+def hhmm_to_minutes(hhmm: str) -> int:
+    # "08:30" -> 510
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return 0
+
+
+def interval_from_prog(horario_inicio_hhmm: str, duracao_min: Optional[int]) -> Tuple[int, int, bool]:
+    """
+    Retorna (ini, fim, has_duration).
+    Se duracao_min não vier, has_duration=False e fim=ini.
+    """
+    ini = hhmm_to_minutes(horario_inicio_hhmm)
+    if duracao_min is None:
+        return ini, ini, False
+    # duração 0 ou negativa vira "sem duração" na prática
+    if duracao_min <= 0:
+        return ini, ini, False
+    return ini, ini + duracao_min, True
+
+
+def interval_from_request(horario: time, duracao_min: Optional[int]) -> Tuple[int, int, bool]:
+    ini = time_to_minutes(horario)
+    if duracao_min is None or duracao_min <= 0:
+        return ini, ini, False
+    return ini, ini + duracao_min, True
+
+
+def overlaps(a_ini: int, a_fim: int, a_has: bool, b_ini: int, b_fim: int, b_has: bool) -> bool:
+    """
+    Regra:
+    - Se ambos têm duração -> conflito se intervalos se sobrepõem
+    - Se um ou ambos não têm duração -> conflito só se horário inicial for igual
+    """
+    if a_has and b_has:
+        # intervalo semi-aberto [ini, fim)
+        return not (a_fim <= b_ini or b_fim <= a_ini)
+    # sem duração: só conflito se mesma hora de início
+    return a_ini == b_ini
+
+
+def conflitos_execucao_regra_b(
+    data_iso: str,
+    executantes_texto: str,
+    novo_horario: time,
+    nova_duracao_min: Optional[int],
+    ignorar_prog_id: Optional[int] = None,
+):
+    alvo_execs = get_exec_set(executantes_texto or "")
+    if not alvo_execs:
+        return []
+
+    a_ini, a_fim, a_has = interval_from_request(novo_horario, nova_duracao_min)
+
+    conflitos = []
+    for p in programacoes:
+        if ignorar_prog_id is not None and p.get("id") == ignorar_prog_id:
+            continue
+        if p.get("data") != data_iso:
+            continue
+
+        b_execs = get_exec_set(p.get("executantes_texto", "") or "")
+        inter_execs = sorted(list(alvo_execs.intersection(b_execs)))
+        if not inter_execs:
+            continue
+
+        b_ini, b_fim, b_has = interval_from_prog(p.get("horario_inicio", "00:00"), p.get("duracao_min"))
+        if overlaps(a_ini, a_fim, a_has, b_ini, b_fim, b_has):
+            conflitos.append({
+                "programacao_id": p.get("id"),
+                "numero_os": p.get("numero_os"),
+                "horario_inicio": p.get("horario_inicio"),
+                "duracao_min": p.get("duracao_min"),
+                "executantes_em_conflito": inter_execs
+            })
+
+    return conflitos
 
 
 # -----------------------------
@@ -158,6 +251,7 @@ class ProgramarRequest(BaseModel):
     data: date
     periodo: str  # "Manhã" | "Tarde"
     horario: time
+    duracao_min: Optional[int] = None  # NOVO (opcional)
     executantes_texto: Optional[str] = ""
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
@@ -165,10 +259,10 @@ class ProgramarRequest(BaseModel):
 
 
 class AtualizarProgramacaoRequest(BaseModel):
-    # tudo editável (inclusive data/período/hora = reprogramação)
     data: date
     periodo: str
     horario: time
+    duracao_min: Optional[int] = None  # NOVO
     executantes_texto: Optional[str] = ""
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
@@ -191,6 +285,24 @@ def programar(req: ProgramarRequest):
     if not os_item:
         raise HTTPException(status_code=404, detail={"erro": "Ordem de serviço não encontrada", "ordem_id": req.ordem_id})
 
+    # Conflito (Regra B)
+    conflitos = conflitos_execucao_regra_b(
+        req.data.isoformat(),
+        req.executantes_texto or "",
+        req.horario,
+        req.duracao_min,
+        ignorar_prog_id=None
+    )
+    if conflitos:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "erro": "Conflito de executantes por horário (Regra B).",
+                "regra": "No mesmo dia, um executante não pode estar em duas atividades com horário igual (sem duração) ou com sobreposição (com duração).",
+                "conflitos": conflitos,
+            },
+        )
+
     tipo = (req.tipo_servico or os_item.get("tipo_servico") or "").strip()
     setor = (os_item.get("setor") or "").strip()
     executantes = parse_executantes_free_text(req.executantes_texto)
@@ -204,6 +316,7 @@ def programar(req: ProgramarRequest):
         "data": req.data.isoformat(),
         "periodo": req.periodo,
         "horario_inicio": req.horario.strftime("%H:%M"),
+        "duracao_min": req.duracao_min,
         "executantes": executantes,
         "executantes_texto": req.executantes_texto or "",
         "tipo_servico": tipo,
@@ -228,9 +341,28 @@ def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
     if req.status and req.status not in STATUS_VALIDOS:
         raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {STATUS_VALIDOS}"})
 
+    # Conflito (Regra B) — ignorando a própria programação
+    conflitos = conflitos_execucao_regra_b(
+        req.data.isoformat(),
+        req.executantes_texto or "",
+        req.horario,
+        req.duracao_min,
+        ignorar_prog_id=prog_id
+    )
+    if conflitos:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "erro": "Conflito de executantes por horário (Regra B).",
+                "regra": "No mesmo dia, um executante não pode estar em duas atividades com horário igual (sem duração) ou com sobreposição (com duração).",
+                "conflitos": conflitos,
+            },
+        )
+
     p["data"] = req.data.isoformat()
     p["periodo"] = req.periodo
     p["horario_inicio"] = req.horario.strftime("%H:%M")
+    p["duracao_min"] = req.duracao_min
     p["executantes_texto"] = req.executantes_texto or ""
     p["executantes"] = parse_executantes_free_text(req.executantes_texto)
     if req.tipo_servico is not None:
