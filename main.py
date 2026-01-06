@@ -1,9 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 from datetime import date, time, datetime
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Dict, Any
 
 app = FastAPI(title="Planner Manutenção - Backend")
 
@@ -17,8 +17,11 @@ app.add_middleware(
 # -----------------------------
 # Armazenamento em memória (MVP)
 # -----------------------------
-ordens = []
-programacoes = []
+ordens: List[Dict[str, Any]] = []
+
+# planners: {planner_id: {id, name, created_at, programacoes: []}}
+planners: Dict[int, Dict[str, Any]] = {}
+next_planner_id = 1
 
 TIPOS_SERVICO_SUGERIDOS = [
     "Altura",
@@ -64,7 +67,6 @@ def time_to_minutes(t: time) -> int:
 
 
 def hhmm_to_minutes(hhmm: str) -> int:
-    # "08:30" -> 510
     try:
         h, m = hhmm.split(":")
         return int(h) * 60 + int(m)
@@ -73,15 +75,8 @@ def hhmm_to_minutes(hhmm: str) -> int:
 
 
 def interval_from_prog(horario_inicio_hhmm: str, duracao_min: Optional[int]) -> Tuple[int, int, bool]:
-    """
-    Retorna (ini, fim, has_duration).
-    Se duracao_min não vier, has_duration=False e fim=ini.
-    """
     ini = hhmm_to_minutes(horario_inicio_hhmm)
-    if duracao_min is None:
-        return ini, ini, False
-    # duração 0 ou negativa vira "sem duração" na prática
-    if duracao_min <= 0:
+    if duracao_min is None or duracao_min <= 0:
         return ini, ini, False
     return ini, ini + duracao_min, True
 
@@ -94,19 +89,33 @@ def interval_from_request(horario: time, duracao_min: Optional[int]) -> Tuple[in
 
 
 def overlaps(a_ini: int, a_fim: int, a_has: bool, b_ini: int, b_fim: int, b_has: bool) -> bool:
-    """
-    Regra:
-    - Se ambos têm duração -> conflito se intervalos se sobrepõem
-    - Se um ou ambos não têm duração -> conflito só se horário inicial for igual
-    """
+    # Regra B:
+    # - ambos com duração -> sobreposição
+    # - sem duração em um dos lados -> conflito só se horário inicial igual
     if a_has and b_has:
-        # intervalo semi-aberto [ini, fim)
         return not (a_fim <= b_ini or b_fim <= a_ini)
-    # sem duração: só conflito se mesma hora de início
     return a_ini == b_ini
 
 
+def get_planner(planner_id: int) -> Dict[str, Any]:
+    p = planners.get(planner_id)
+    if not p:
+        raise HTTPException(status_code=404, detail={"erro": "Planner não encontrado", "planner_id": planner_id})
+    return p
+
+
+def get_programacoes(planner_id: int) -> List[Dict[str, Any]]:
+    planner = get_planner(planner_id)
+    return planner["programacoes"]
+
+
+def find_programacao(planner_id: int, prog_id: int) -> Optional[Dict[str, Any]]:
+    progs = get_programacoes(planner_id)
+    return next((p for p in progs if p.get("id") == prog_id), None)
+
+
 def conflitos_execucao_regra_b(
+    progs: List[Dict[str, Any]],
     data_iso: str,
     executantes_texto: str,
     novo_horario: time,
@@ -120,7 +129,7 @@ def conflitos_execucao_regra_b(
     a_ini, a_fim, a_has = interval_from_request(novo_horario, nova_duracao_min)
 
     conflitos = []
-    for p in programacoes:
+    for p in progs:
         if ignorar_prog_id is not None and p.get("id") == ignorar_prog_id:
             continue
         if p.get("data") != data_iso:
@@ -142,6 +151,42 @@ def conflitos_execucao_regra_b(
             })
 
     return conflitos
+
+
+# -----------------------------
+# Planners (Programações nomeadas)
+# -----------------------------
+class CreatePlannerRequest(BaseModel):
+    name: str
+
+
+@app.post("/planners")
+def create_planner(req: CreatePlannerRequest):
+    global next_planner_id
+    name = (req.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail={"erro": "Nome do planner é obrigatório."})
+
+    # evita nomes duplicados (opcional)
+    for p in planners.values():
+        if (p.get("name") or "").strip().lower() == name.lower():
+            raise HTTPException(status_code=409, detail={"erro": "Já existe um planner com esse nome."})
+
+    pid = next_planner_id
+    next_planner_id += 1
+    planners[pid] = {
+        "id": pid,
+        "name": name,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "programacoes": [],
+        "next_prog_id": 1,
+    }
+    return {"status": "OK", "planner": {"id": pid, "name": name}}
+
+
+@app.get("/planners")
+def list_planners():
+    return [{"id": p["id"], "name": p["name"], "created_at": p["created_at"]} for p in planners.values()]
 
 
 # -----------------------------
@@ -214,8 +259,17 @@ async def importar_excel(file: UploadFile = File(...)):
 
 
 @app.get("/ordens")
-def listar_ordens():
-    return ordens
+def listar_ordens(planner_id: Optional[int] = Query(default=None)):
+    """
+    Se planner_id for informado:
+      retorna apenas OS que NÃO estão usadas nesse planner (uma OS por ordem_id).
+    """
+    if planner_id is None:
+        return ordens
+
+    progs = get_programacoes(planner_id)
+    usados = set(p.get("ordem_id") for p in progs)
+    return [o for o in ordens if o.get("id") not in usados]
 
 
 @app.get("/setores")
@@ -247,11 +301,12 @@ def listar_status():
 # Programação (Planner)
 # -----------------------------
 class ProgramarRequest(BaseModel):
+    planner_id: int
     ordem_id: int
     data: date
     periodo: str  # "Manhã" | "Tarde"
     horario: time
-    duracao_min: Optional[int] = None  # NOVO (opcional)
+    duracao_min: Optional[int] = None
     executantes_texto: Optional[str] = ""
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
@@ -259,18 +314,15 @@ class ProgramarRequest(BaseModel):
 
 
 class AtualizarProgramacaoRequest(BaseModel):
+    planner_id: int
     data: date
     periodo: str
     horario: time
-    duracao_min: Optional[int] = None  # NOVO
+    duracao_min: Optional[int] = None
     executantes_texto: Optional[str] = ""
     tipo_servico: Optional[str] = None
     status: Optional[str] = "Planejado"
     observacoes: Optional[str] = ""
-
-
-def find_programacao(prog_id: int):
-    return next((p for p in programacoes if p.get("id") == prog_id), None)
 
 
 @app.post("/programar")
@@ -281,12 +333,20 @@ def programar(req: ProgramarRequest):
     if req.status and req.status not in STATUS_VALIDOS:
         raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {STATUS_VALIDOS}"})
 
+    planner = get_planner(req.planner_id)
+    progs = planner["programacoes"]
+
     os_item = next((o for o in ordens if o.get("id") == req.ordem_id), None)
     if not os_item:
         raise HTTPException(status_code=404, detail={"erro": "Ordem de serviço não encontrada", "ordem_id": req.ordem_id})
 
-    # Conflito (Regra B)
+    # regra: OS não pode repetir no mesmo planner
+    if any(p.get("ordem_id") == req.ordem_id for p in progs):
+        raise HTTPException(status_code=409, detail={"erro": "Essa OS já está usada neste planner."})
+
+    # Conflitos (Regra B)
     conflitos = conflitos_execucao_regra_b(
+        progs,
         req.data.isoformat(),
         req.executantes_texto or "",
         req.horario,
@@ -298,7 +358,6 @@ def programar(req: ProgramarRequest):
             status_code=409,
             detail={
                 "erro": "Conflito de executantes por horário (Regra B).",
-                "regra": "No mesmo dia, um executante não pode estar em duas atividades com horário igual (sem duração) ou com sobreposição (com duração).",
                 "conflitos": conflitos,
             },
         )
@@ -307,8 +366,11 @@ def programar(req: ProgramarRequest):
     setor = (os_item.get("setor") or "").strip()
     executantes = parse_executantes_free_text(req.executantes_texto)
 
+    prog_id = planner["next_prog_id"]
+    planner["next_prog_id"] += 1
+
     prog = {
-        "id": len(programacoes) + 1,
+        "id": prog_id,
         "ordem_id": os_item["id"],
         "numero_os": os_item.get("numero_os"),
         "descricao": os_item.get("descricao"),
@@ -325,13 +387,36 @@ def programar(req: ProgramarRequest):
         "criado_em": datetime.utcnow().isoformat() + "Z",
         "atualizado_em": None,
     }
-    programacoes.append(prog)
+    progs.append(prog)
     return {"status": "OK", "programacao": prog}
+
+
+@app.get("/programacoes")
+def listar_programacoes(
+    planner_id: int = Query(...),
+    data_ini: Optional[date] = None,
+    data_fim: Optional[date] = None,
+):
+    progs = get_programacoes(planner_id)
+
+    if data_ini or data_fim:
+        def in_range(p):
+            d = date.fromisoformat(p["data"])
+            if data_ini and d < data_ini:
+                return False
+            if data_fim and d > data_fim:
+                return False
+            return True
+        return [p for p in progs if in_range(p)]
+
+    return progs
 
 
 @app.put("/programacoes/{prog_id}")
 def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
-    p = find_programacao(prog_id)
+    planner = get_planner(req.planner_id)
+    progs = planner["programacoes"]
+    p = find_programacao(req.planner_id, prog_id)
     if not p:
         raise HTTPException(status_code=404, detail={"erro": "Programação não encontrada", "id": prog_id})
 
@@ -341,8 +426,8 @@ def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
     if req.status and req.status not in STATUS_VALIDOS:
         raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {STATUS_VALIDOS}"})
 
-    # Conflito (Regra B) — ignorando a própria programação
     conflitos = conflitos_execucao_regra_b(
+        progs,
         req.data.isoformat(),
         req.executantes_texto or "",
         req.horario,
@@ -354,7 +439,6 @@ def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
             status_code=409,
             detail={
                 "erro": "Conflito de executantes por horário (Regra B).",
-                "regra": "No mesmo dia, um executante não pode estar em duas atividades com horário igual (sem duração) ou com sobreposição (com duração).",
                 "conflitos": conflitos,
             },
         )
@@ -374,26 +458,11 @@ def atualizar_programacao(prog_id: int, req: AtualizarProgramacaoRequest):
 
 
 @app.delete("/programacoes/{prog_id}")
-def deletar_programacao(prog_id: int):
-    p = find_programacao(prog_id)
+def deletar_programacao(prog_id: int, planner_id: int = Query(...)):
+    planner = get_planner(planner_id)
+    progs = planner["programacoes"]
+    p = find_programacao(planner_id, prog_id)
     if not p:
         raise HTTPException(status_code=404, detail={"erro": "Programação não encontrada", "id": prog_id})
-    programacoes.remove(p)
+    progs.remove(p)
     return {"status": "OK", "removida_id": prog_id}
-
-
-@app.get("/programacoes")
-def listar_programacoes(
-    data_ini: Optional[date] = None,
-    data_fim: Optional[date] = None,
-):
-    if data_ini or data_fim:
-        def in_range(p):
-            d = date.fromisoformat(p["data"])
-            if data_ini and d < data_ini:
-                return False
-            if data_fim and d > data_fim:
-                return False
-            return True
-        return [p for p in programacoes if in_range(p)]
-    return programacoes
