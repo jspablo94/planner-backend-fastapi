@@ -1,10 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import pandas as pd
+from datetime import date, time, datetime
+from typing import List, Optional
 
 app = FastAPI(title="Planner Manutenção - Backend")
 
-# CORS para permitir StackBlitz/qualquer origem
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,57 +14,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------
 # Armazenamento em memória (MVP)
+# -----------------------------
 ordens = []
+programacoes = []
+
+TIPOS_SERVICO_VALIDOS = {
+    "Altura",
+    "Espaço Confinado",
+    "Trabalho a quente",
+    "Trabalho elétrico",
+    "Terceirizado",
+}
+
+STATUS_VALIDOS = {"Planejado", "Em execução", "Concluído", "Reprogramado"}
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove espaços e padroniza nomes de colunas."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
+# -----------------------------
+# Importação (Excel/CSV)
+# -----------------------------
 @app.post("/importar-excel")
 async def importar_excel(file: UploadFile = File(...)):
-    """
-    Recebe um arquivo (xlsx/xls/csv), lê e adiciona as ordens em memória.
-    Espera colunas equivalentes a: OS, Descricao/Descrição, Tipo/Tipo de Serviço
-    """
     try:
         filename = (file.filename or "").lower()
-
-        # Lê o arquivo inteiro em memória
         raw = await file.read()
 
-        # Decide como ler baseado na extensão
         if filename.endswith(".csv"):
             df = pd.read_csv(pd.io.common.BytesIO(raw))
         elif filename.endswith(".xls"):
-            # .xls precisa do xlrd
             df = pd.read_excel(pd.io.common.BytesIO(raw), engine="xlrd")
         else:
-            # default: .xlsx
             df = pd.read_excel(pd.io.common.BytesIO(raw), engine="openpyxl")
 
         df = normalize_columns(df)
         cols = df.columns.tolist()
 
-        # Fallbacks de nomes comuns (você pode ampliar depois)
         col_os = "OS" if "OS" in cols else ("Ordem" if "Ordem" in cols else None)
+        col_desc = "Descricao" if "Descricao" in cols else ("Descrição" if "Descrição" in cols else None)
+        col_tipo = "Tipo" if "Tipo" in cols else ("Tipo de Serviço" if "Tipo de Serviço" in cols else None)
 
-        # Alguns CMMS exportam com acento
-        col_desc = (
-            "Descricao" if "Descricao" in cols else
-            ("Descrição" if "Descrição" in cols else None)
-        )
-
-        col_tipo = (
-            "Tipo" if "Tipo" in cols else
-            ("Tipo de Serviço" if "Tipo de Serviço" in cols else None)
-        )
-
-        # Se não encontrou colunas mínimas, devolve 400 com diagnóstico
         if not col_os or not col_desc or not col_tipo:
             raise HTTPException(
                 status_code=400,
@@ -70,8 +67,7 @@ async def importar_excel(file: UploadFile = File(...)):
                     "erro": "Não encontrei as colunas esperadas.",
                     "colunas_encontradas": cols,
                     "esperado": ["OS (ou Ordem)", "Descricao/Descrição", "Tipo/Tipo de Serviço"],
-                    "dica": "Me diga os nomes exatos das colunas do seu Excel para eu ajustar o mapeamento."
-                }
+                },
             )
 
         count_before = len(ordens)
@@ -81,32 +77,107 @@ async def importar_excel(file: UploadFile = File(...)):
             descricao = str(row.get(col_desc, "")).strip()
             tipo = str(row.get(col_tipo, "")).strip()
 
-            # Ignora linhas totalmente vazias
             if not (numero_os or descricao or tipo):
                 continue
 
-            ordens.append({
-                "id": len(ordens) + 1,
-                "numero_os": numero_os,
-                "descricao": descricao,
-                "tipo_servico": tipo,
-            })
+            ordens.append(
+                {
+                    "id": len(ordens) + 1,
+                    "numero_os": numero_os,
+                    "descricao": descricao,
+                    "tipo_servico": tipo,
+                }
+            )
 
         return {
             "status": "Importação concluída",
             "adicionadas": len(ordens) - count_before,
             "total": len(ordens),
-            "colunas_lidas": cols
+            "colunas_lidas": cols,
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        # Retorna o erro real para facilitar correção
         raise HTTPException(status_code=500, detail={"erro": str(e)})
 
 
 @app.get("/ordens")
 def listar_ordens():
-    """Retorna as ordens importadas (em memória)."""
     return ordens
+
+
+# -----------------------------
+# Programação (Planner)
+# -----------------------------
+class ProgramarRequest(BaseModel):
+    ordem_id: int
+    data: date
+    periodo: str  # "Manhã" | "Tarde"
+    horario: time
+    executantes: Optional[List[str]] = []
+    tipo_servico: Optional[str] = None
+    status: Optional[str] = "Planejado"
+    observacoes: Optional[str] = ""
+
+
+@app.post("/programar")
+def programar(req: ProgramarRequest):
+    # valida período
+    if req.periodo not in {"Manhã", "Tarde"}:
+        raise HTTPException(status_code=400, detail={"erro": "periodo inválido. Use 'Manhã' ou 'Tarde'."})
+
+    # valida status
+    if req.status and req.status not in STATUS_VALIDOS:
+        raise HTTPException(status_code=400, detail={"erro": f"status inválido. Use um de {sorted(STATUS_VALIDOS)}"})
+
+    # acha OS
+    os_item = next((o for o in ordens if o.get("id") == req.ordem_id), None)
+    if not os_item:
+        raise HTTPException(status_code=404, detail={"erro": "Ordem de serviço não encontrada", "ordem_id": req.ordem_id})
+
+    # define tipo_servico (se não vier, usa o da OS)
+    tipo = req.tipo_servico or os_item.get("tipo_servico") or ""
+
+    # (opcional) validar contra lista de tipos conhecidos
+    # Se seu CMMS tiver variações, pode comentar esta validação.
+    if tipo in TIPOS_SERVICO_VALIDOS or tipo == "":
+        pass
+    # else: não bloqueia, só aceita (mantém flexível)
+
+    prog = {
+        "id": len(programacoes) + 1,
+        "ordem_id": os_item["id"],
+        "numero_os": os_item.get("numero_os"),
+        "descricao": os_item.get("descricao"),
+        "data": req.data.isoformat(),
+        "periodo": req.periodo,
+        "horario_inicio": req.horario.strftime("%H:%M"),
+        "executantes": req.executantes or [],
+        "tipo_servico": tipo,
+        "status": req.status or "Planejado",
+        "observacoes": req.observacoes or "",
+        "criado_em": datetime.utcnow().isoformat() + "Z",
+    }
+    programacoes.append(prog)
+    return {"status": "OK", "programacao": prog}
+
+
+@app.get("/programacoes")
+def listar_programacoes(
+    data_ini: Optional[date] = None,
+    data_fim: Optional[date] = None,
+):
+    # se vier filtro de data, aplica
+    if data_ini or data_fim:
+        def in_range(p):
+            d = date.fromisoformat(p["data"])
+            if data_ini and d < data_ini:
+                return False
+            if data_fim and d > data_fim:
+                return False
+            return True
+
+        return [p for p in programacoes if in_range(p)]
+
+    return programacoes
